@@ -1,6 +1,8 @@
 import os
 import json
 import logging
+import asyncio
+import nest_asyncio
 from datetime import date, timedelta
 from telegram import Update
 from telegram.ext import (
@@ -8,6 +10,8 @@ from telegram.ext import (
     ContextTypes, filters
 )
 from flask import Flask, request
+
+nest_asyncio.apply()
 
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
@@ -114,19 +118,24 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 @flask_app.route("/webhook", methods=["POST"])
 def webhook():
-    import asyncio
     update = Update.de_json(request.get_json(force=True), application.bot)
-    asyncio.run(application.process_update(update))
+    asyncio.get_event_loop().run_until_complete(
+        application.process_update(update)
+    )
     return "OK"
 
 @flask_app.route("/")
 def home():
     return "Bot is running!"
 
-async def setup_webhook(app):
+async def set_webhook():
     webhook_url = os.environ.get("WEBHOOK_URL")
-    await app.bot.set_webhook(url=f"{webhook_url}/webhook")
-    logger.info(f"Webhook set: {webhook_url}/webhook")
+    async with application:
+        await application.bot.set_webhook(
+            url=f"{webhook_url}/webhook",
+            drop_pending_updates=True
+        )
+        logger.info(f"Webhook set: {webhook_url}/webhook")
 
 def main():
     global application
@@ -144,10 +153,9 @@ def main():
         filters.TEXT & ~filters.COMMAND, record_message
     ))
 
-    import asyncio
-    asyncio.run(setup_webhook(application))
+    asyncio.get_event_loop().run_until_complete(set_webhook())
 
-    port = int(os.environ.get("PORT", 5000))
+    port = int(os.environ.get("PORT", 10000))
     flask_app.run(host="0.0.0.0", port=port)
 
 if __name__ == "__main__":
