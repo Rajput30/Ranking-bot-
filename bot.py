@@ -21,7 +21,11 @@ logger = logging.getLogger(__name__)
 
 DATA_FILE = "message_data.json"
 flask_app = Flask(__name__)
-application = None
+
+TOKEN = os.environ.get("BOT_TOKEN", "")
+WEBHOOK_URL = os.environ.get("WEBHOOK_URL", "")
+
+application = Application.builder().token(TOKEN).build()
 
 def load_data():
     if os.path.exists(DATA_FILE):
@@ -116,9 +120,19 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     await update.message.reply_text(msg, parse_mode="Markdown")
 
+application.add_handler(CommandHandler("start", cmd_start))
+application.add_handler(CommandHandler("today", cmd_today))
+application.add_handler(CommandHandler("yesterday", cmd_yesterday))
+application.add_handler(CommandHandler("week", cmd_week))
+application.add_handler(CommandHandler("overall", cmd_overall))
+application.add_handler(MessageHandler(
+    filters.TEXT & ~filters.COMMAND, record_message
+))
+
 @flask_app.route("/webhook", methods=["POST"])
 def webhook():
-    update = Update.de_json(request.get_json(force=True), application.bot)
+    data = request.get_json(force=True)
+    update = Update.de_json(data, application.bot)
     asyncio.get_event_loop().run_until_complete(
         application.process_update(update)
     )
@@ -128,35 +142,21 @@ def webhook():
 def home():
     return "Bot is running!"
 
-async def set_webhook():
-    webhook_url = os.environ.get("WEBHOOK_URL")
-    async with application:
+@flask_app.route("/set_webhook")
+def set_webhook_route():
+    async def _set():
         await application.bot.set_webhook(
-            url=f"{webhook_url}/webhook",
+            url=f"{WEBHOOK_URL}/webhook",
             drop_pending_updates=True
         )
-        logger.info(f"Webhook set: {webhook_url}/webhook")
+    asyncio.get_event_loop().run_until_complete(_set())
+    return f"Webhook set to {WEBHOOK_URL}/webhook"
 
-def main():
-    global application
-    token = os.environ.get("BOT_TOKEN")
-    if not token:
-        raise ValueError("BOT_TOKEN set nahi hai!")
-
-    application = Application.builder().token(token).build()
-    application.add_handler(CommandHandler("start", cmd_start))
-    application.add_handler(CommandHandler("today", cmd_today))
-    application.add_handler(CommandHandler("yesterday", cmd_yesterday))
-    application.add_handler(CommandHandler("week", cmd_week))
-    application.add_handler(CommandHandler("overall", cmd_overall))
-    application.add_handler(MessageHandler(
-        filters.TEXT & ~filters.COMMAND, record_message
-    ))
-
-    asyncio.get_event_loop().run_until_complete(set_webhook())
-
-    port = int(os.environ.get("PORT", 10000))
-    flask_app.run(host="0.0.0.0", port=port)
+@flask_app.route("/init")
+def init():
+    asyncio.get_event_loop().run_until_complete(application.initialize())
+    return "Initialized!"
 
 if __name__ == "__main__":
-    main()
+    port = int(os.environ.get("PORT", 10000))
+    flask_app.run(host="0.0.0.0", port=port)
