@@ -1,6 +1,6 @@
 import os
-import json
 import requests
+import psycopg2
 from datetime import date, timedelta
 from flask import Flask, request
 
@@ -8,7 +8,27 @@ app = Flask(__name__)
 
 TOKEN = os.environ.get("BOT_TOKEN", "")
 WEBHOOK_URL = os.environ.get("WEBHOOK_URL", "")
-DATA_FILE = "message_data.json"
+DATABASE_URL = os.environ.get("DATABASE_URL", "")
+
+def get_conn():
+    return psycopg2.connect(DATABASE_URL)
+
+def init_db():
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS messages (
+            user_id TEXT,
+            username TEXT,
+            tg_username TEXT,
+            msg_date TEXT,
+            count INTEGER DEFAULT 0,
+            PRIMARY KEY (user_id, msg_date)
+        )
+    """)
+    conn.commit()
+    cur.close()
+    conn.close()
 
 def send_message(chat_id, text):
     url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
@@ -18,37 +38,78 @@ def send_message(chat_id, text):
         "parse_mode": "Markdown"
     })
 
-def load_data():
-    if os.path.exists(DATA_FILE):
-        with open(DATA_FILE, "r") as f:
-            return json.load(f)
-    return {}
+def record_message(user_id, username, tg_username, today):
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT INTO messages (user_id, username, tg_username, msg_date, count)
+        VALUES (%s, %s, %s, %s, 1)
+        ON CONFLICT (user_id, msg_date)
+        DO UPDATE SET count = messages.count + 1,
+                      username = EXCLUDED.username,
+                      tg_username = EXCLUDED.tg_username
+    """, (str(user_id), username, tg_username, today))
+    conn.commit()
+    cur.close()
+    conn.close()
 
-def save_data(data):
-    with open(DATA_FILE, "w") as f:
-        json.dump(data, f, indent=2)
+def get_scores_for_dates(dates):
+    conn = get_conn()
+    cur = conn.cursor()
+    placeholders = ','.join(['%s'] * len(dates))
+    cur.execute(f"""
+        SELECT username, tg_username, SUM(count) as total
+        FROM messages
+        WHERE msg_date IN ({placeholders})
+        GROUP BY username, tg_username
+        ORDER BY total DESC
+    """, dates)
+    rows = cur.fetchall()
+    cur.close()
+    conn.close()
+    return rows
 
-def record_message(user_id, username, today):
-    data = load_data()
-    uid = str(user_id)
-    if uid not in data:
-        data[uid] = {"name": username, "daily": {}, "total": 0}
-    data[uid]["name"] = username
-    if today not in data[uid]["daily"]:
-        data[uid]["daily"][today] = 0
-    data[uid]["daily"][today] += 1
-    data[uid]["total"] += 1
-    save_data(data)
+def get_overall_scores():
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT username, tg_username, SUM(count) as total
+        FROM messages
+        GROUP BY username, tg_username
+        ORDER BY total DESC
+    """)
+    rows = cur.fetchall()
+    cur.close()
+    conn.close()
+    return rows
 
-def build_leaderboard(scores, title):
-    if not scores:
+def build_leaderboard(rows, title):
+    if not rows:
         return f"*{title}*\n\nKoi data nahi mila 😕"
-    sorted_users = sorted(scores.items(), key=lambda x: x[1], reverse=True)
     medals = ["🥇", "🥈", "🥉"]
     lines = [f"*{title}*\n"]
-    for i, (name, count) in enumerate(sorted_users):
+    for i, (name, tg_username, count) in enumerate(rows):
         medal = medals[i] if i < 3 else f"{i+1}."
         lines.append(f"{medal} {name} — *{count}* msgs")
+    return "\n".join(lines)
+
+def build_congrats(rows):
+    if not rows:
+        return None
+    congrats_templates = [
+        "🎉 Congratulations {tag}! Aap is baar ke *Chat King* hain! 👑🔥",
+        "🥈 Shabash {tag}! Aap doosre number pe hain! 💪 Keep it up!",
+        "🥉 Wah {tag}! Teesre number pe ho, mazboot raho! 🔥"
+    ]
+    lines = ["🏅 *Top Chatters Ko Badhai!*\n"]
+    for i, template in enumerate(congrats_templates):
+        if i < len(rows):
+            name, tg_username, count = rows[i]
+            if tg_username:
+                tag = f"@{tg_username}"
+            else:
+                tag = f"*{name}*"
+            lines.append(template.format(tag=tag))
     return "\n".join(lines)
 
 def handle_update(update):
@@ -57,12 +118,13 @@ def handle_update(update):
         return
 
     chat_id = message.get("chat", {}).get("id")
-    text = message.get("text", "")
+    text = message.get("text", "") or ""
     user = message.get("from", {})
     user_id = user.get("id")
     first = user.get("first_name", "")
     last = user.get("last_name", "")
-    username = f"{first} {last}".strip() or user.get("username") or f"User_{user_id}"
+    tg_username = user.get("username", "")
+    username = f"{first} {last}".strip() or tg_username or f"User_{user_id}"
     today = str(date.today())
 
     if text.startswith("/start"):
@@ -77,36 +139,38 @@ def handle_update(update):
         )
 
     elif text.startswith("/today"):
-        data = load_data()
-        scores = {v["name"]: v["daily"].get(today, 0)
-                  for v in data.values() if v["daily"].get(today, 0) > 0}
-        send_message(chat_id, build_leaderboard(scores, f"📊 Aaj Ki Ranking ({today})"))
+        rows = get_scores_for_dates([today])
+        send_message(chat_id, build_leaderboard(rows, f"📊 Aaj Ki Ranking ({today})"))
+        congrats = build_congrats(rows)
+        if congrats:
+            send_message(chat_id, congrats)
 
     elif text.startswith("/yesterday"):
-        data = load_data()
         yesterday = str(date.today() - timedelta(days=1))
-        scores = {v["name"]: v["daily"].get(yesterday, 0)
-                  for v in data.values() if v["daily"].get(yesterday, 0) > 0}
-        send_message(chat_id, build_leaderboard(scores, f"📅 Kal Ki Ranking ({yesterday})"))
+        rows = get_scores_for_dates([yesterday])
+        send_message(chat_id, build_leaderboard(rows, f"📅 Kal Ki Ranking ({yesterday})"))
+        congrats = build_congrats(rows)
+        if congrats:
+            send_message(chat_id, congrats)
 
     elif text.startswith("/week"):
-        data = load_data()
         week_dates = [str(date.today() - timedelta(days=i)) for i in range(7)]
-        scores = {}
-        for v in data.values():
-            count = sum(v["daily"].get(d, 0) for d in week_dates)
-            if count > 0:
-                scores[v["name"]] = count
-        send_message(chat_id, build_leaderboard(scores, "📆 Is Hafte Ki Ranking (Last 7 Days)"))
+        rows = get_scores_for_dates(week_dates)
+        send_message(chat_id, build_leaderboard(rows, "📆 Is Hafte Ki Ranking (Last 7 Days)"))
+        congrats = build_congrats(rows)
+        if congrats:
+            send_message(chat_id, congrats)
 
     elif text.startswith("/overall"):
-        data = load_data()
-        scores = {v["name"]: v["total"] for v in data.values() if v["total"] > 0}
-        send_message(chat_id, build_leaderboard(scores, "🏆 Overall Ranking (All Time)"))
+        rows = get_overall_scores()
+        send_message(chat_id, build_leaderboard(rows, "🏆 Overall Ranking (All Time)"))
+        congrats = build_congrats(rows)
+        if congrats:
+            send_message(chat_id, congrats)
 
     else:
         if user_id:
-            record_message(user_id, username, today)
+            record_message(user_id, username, tg_username, today)
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
@@ -116,6 +180,7 @@ def webhook():
 
 @app.route("/")
 def home():
+    init_db()
     return "Bot is running!"
 
 @app.route("/set_webhook")
@@ -128,5 +193,6 @@ def set_webhook():
     return f"Webhook set: {res.json()}"
 
 if __name__ == "__main__":
+    init_db()
     port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port)
