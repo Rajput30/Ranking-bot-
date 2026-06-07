@@ -16,14 +16,16 @@ def get_conn():
 def init_db():
     conn = get_conn()
     cur = conn.cursor()
+    cur.execute("DROP TABLE IF EXISTS messages")
     cur.execute("""
         CREATE TABLE IF NOT EXISTS messages (
+            chat_id TEXT,
             user_id TEXT,
             username TEXT,
             tg_username TEXT,
             msg_date TEXT,
             count INTEGER DEFAULT 0,
-            PRIMARY KEY (user_id, msg_date)
+            PRIMARY KEY (chat_id, user_id, msg_date)
         )
     """)
     conn.commit()
@@ -38,46 +40,47 @@ def send_message(chat_id, text):
         "parse_mode": "Markdown"
     })
 
-def record_message(user_id, username, tg_username, today):
+def record_message(chat_id, user_id, username, tg_username, today):
     conn = get_conn()
     cur = conn.cursor()
     cur.execute("""
-        INSERT INTO messages (user_id, username, tg_username, msg_date, count)
-        VALUES (%s, %s, %s, %s, 1)
-        ON CONFLICT (user_id, msg_date)
+        INSERT INTO messages (chat_id, user_id, username, tg_username, msg_date, count)
+        VALUES (%s, %s, %s, %s, %s, 1)
+        ON CONFLICT (chat_id, user_id, msg_date)
         DO UPDATE SET count = messages.count + 1,
                       username = EXCLUDED.username,
                       tg_username = EXCLUDED.tg_username
-    """, (str(user_id), username, tg_username, today))
+    """, (str(chat_id), str(user_id), username, tg_username, today))
     conn.commit()
     cur.close()
     conn.close()
 
-def get_scores_for_dates(dates):
+def get_scores_for_dates(chat_id, dates):
     conn = get_conn()
     cur = conn.cursor()
     placeholders = ','.join(['%s'] * len(dates))
     cur.execute(f"""
         SELECT username, tg_username, SUM(count) as total
         FROM messages
-        WHERE msg_date IN ({placeholders})
+        WHERE chat_id = %s AND msg_date IN ({placeholders})
         GROUP BY username, tg_username
         ORDER BY total DESC
-    """, dates)
+    """, [str(chat_id)] + dates)
     rows = cur.fetchall()
     cur.close()
     conn.close()
     return rows
 
-def get_overall_scores():
+def get_overall_scores(chat_id):
     conn = get_conn()
     cur = conn.cursor()
     cur.execute("""
         SELECT username, tg_username, SUM(count) as total
         FROM messages
+        WHERE chat_id = %s
         GROUP BY username, tg_username
         ORDER BY total DESC
-    """)
+    """, (str(chat_id),))
     rows = cur.fetchall()
     cur.close()
     conn.close()
@@ -105,10 +108,7 @@ def build_congrats(rows):
     for i, template in enumerate(congrats_templates):
         if i < len(rows):
             name, tg_username, count = rows[i]
-            if tg_username:
-                tag = f"@{tg_username}"
-            else:
-                tag = f"*{name}*"
+            tag = f"@{tg_username}" if tg_username else f"*{name}*"
             lines.append(template.format(tag=tag))
     return "\n".join(lines)
 
@@ -139,7 +139,7 @@ def handle_update(update):
         )
 
     elif text.startswith("/today"):
-        rows = get_scores_for_dates([today])
+        rows = get_scores_for_dates(chat_id, [today])
         send_message(chat_id, build_leaderboard(rows, f"📊 Aaj Ki Ranking ({today})"))
         congrats = build_congrats(rows)
         if congrats:
@@ -147,7 +147,7 @@ def handle_update(update):
 
     elif text.startswith("/yesterday"):
         yesterday = str(date.today() - timedelta(days=1))
-        rows = get_scores_for_dates([yesterday])
+        rows = get_scores_for_dates(chat_id, [yesterday])
         send_message(chat_id, build_leaderboard(rows, f"📅 Kal Ki Ranking ({yesterday})"))
         congrats = build_congrats(rows)
         if congrats:
@@ -155,14 +155,14 @@ def handle_update(update):
 
     elif text.startswith("/week"):
         week_dates = [str(date.today() - timedelta(days=i)) for i in range(7)]
-        rows = get_scores_for_dates(week_dates)
+        rows = get_scores_for_dates(chat_id, week_dates)
         send_message(chat_id, build_leaderboard(rows, "📆 Is Hafte Ki Ranking (Last 7 Days)"))
         congrats = build_congrats(rows)
         if congrats:
             send_message(chat_id, congrats)
 
     elif text.startswith("/overall"):
-        rows = get_overall_scores()
+        rows = get_overall_scores(chat_id)
         send_message(chat_id, build_leaderboard(rows, "🏆 Overall Ranking (All Time)"))
         congrats = build_congrats(rows)
         if congrats:
@@ -170,7 +170,7 @@ def handle_update(update):
 
     else:
         if user_id:
-            record_message(user_id, username, tg_username, today)
+            record_message(chat_id, user_id, username, tg_username, today)
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
