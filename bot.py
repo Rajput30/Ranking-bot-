@@ -16,7 +16,6 @@ def get_conn():
 def init_db():
     conn = get_conn()
     cur = conn.cursor()
-    cur.execute("DROP TABLE IF EXISTS messages")
     cur.execute("""
         CREATE TABLE IF NOT EXISTS messages (
             chat_id TEXT,
